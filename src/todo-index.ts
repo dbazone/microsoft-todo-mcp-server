@@ -15,6 +15,7 @@ console.error("Current working directory:", process.cwd())
 // Microsoft Graph API endpoints
 const MS_GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 const USER_AGENT = "microsoft-todo-mcp-server/1.0"
+const encodePathSegment = (value: string) => encodeURIComponent(value)
 
 // Create server instance
 const server = new McpServer({
@@ -722,7 +723,7 @@ server.tool(
 
       // Make the API request to update the task list
       const response = await makeGraphRequest<TaskList>(
-        `${MS_GRAPH_BASE}/me/todo/lists/${listId}`,
+        `${MS_GRAPH_BASE}/me/todo/lists/${encodePathSegment(listId)}`,
         token,
         "PATCH",
         requestBody,
@@ -781,7 +782,7 @@ server.tool(
       }
 
       // Make a DELETE request to the Microsoft Graph API
-      const url = `${MS_GRAPH_BASE}/me/todo/lists/${listId}`
+      const url = `${MS_GRAPH_BASE}/me/todo/lists/${encodePathSegment(listId)}`
       console.error(`Deleting task list: ${url}`)
 
       // The DELETE method doesn't return a response body, so we expect null
@@ -847,7 +848,7 @@ server.tool(
 
       // Construct the URL with query parameters
       const queryString = queryParams.toString()
-      const url = `${MS_GRAPH_BASE}/me/todo/lists/${listId}/tasks${queryString ? "?" + queryString : ""}`
+      const url = `${MS_GRAPH_BASE}/me/todo/lists/${encodePathSegment(listId)}/tasks${queryString ? "?" + queryString : ""}`
 
       console.error(`Making request to: ${url}`)
 
@@ -1034,7 +1035,7 @@ server.tool(
       }
 
       const response = await makeGraphRequest<Task>(
-        `${MS_GRAPH_BASE}/me/todo/lists/${listId}/tasks`,
+        `${MS_GRAPH_BASE}/me/todo/lists/${encodePathSegment(listId)}/tasks`,
         token,
         "POST",
         taskBody,
@@ -1197,7 +1198,7 @@ server.tool(
       }
 
       const response = await makeGraphRequest<Task>(
-        `${MS_GRAPH_BASE}/me/todo/lists/${listId}/tasks/${taskId}`,
+        `${MS_GRAPH_BASE}/me/todo/lists/${encodePathSegment(listId)}/tasks/${encodePathSegment(taskId)}`,
         token,
         "PATCH",
         taskBody,
@@ -1257,7 +1258,7 @@ server.tool(
       }
 
       // Make a DELETE request to the Microsoft Graph API
-      const url = `${MS_GRAPH_BASE}/me/todo/lists/${listId}/tasks/${taskId}`
+      const url = `${MS_GRAPH_BASE}/me/todo/lists/${encodePathSegment(listId)}/tasks/${encodePathSegment(taskId)}`
       console.error(`Deleting task: ${url}`)
 
       // The DELETE method doesn't return a response body, so we expect null
@@ -1308,7 +1309,7 @@ server.tool(
 
       // Fetch the task first to get its title
       const taskResponse = await makeGraphRequest<Task>(
-        `${MS_GRAPH_BASE}/me/todo/lists/${listId}/tasks/${taskId}`,
+        `${MS_GRAPH_BASE}/me/todo/lists/${encodePathSegment(listId)}/tasks/${encodePathSegment(taskId)}`,
         token,
       )
 
@@ -1316,7 +1317,7 @@ server.tool(
 
       // Fetch the checklist items
       const response = await makeGraphRequest<{ value: ChecklistItem[] }>(
-        `${MS_GRAPH_BASE}/me/todo/lists/${listId}/tasks/${taskId}/checklistItems`,
+        `${MS_GRAPH_BASE}/me/todo/lists/${encodePathSegment(listId)}/tasks/${encodePathSegment(taskId)}/checklistItems`,
         token,
       )
 
@@ -1411,7 +1412,7 @@ server.tool(
 
       // Make the API request to create the checklist item
       const response = await makeGraphRequest<ChecklistItem>(
-        `${MS_GRAPH_BASE}/me/todo/lists/${listId}/tasks/${taskId}/checklistItems`,
+        `${MS_GRAPH_BASE}/me/todo/lists/${encodePathSegment(listId)}/tasks/${encodePathSegment(taskId)}/checklistItems`,
         token,
         "POST",
         requestBody,
@@ -1498,7 +1499,7 @@ server.tool(
 
       // Make the API request to update the checklist item
       const response = await makeGraphRequest<ChecklistItem>(
-        `${MS_GRAPH_BASE}/me/todo/lists/${listId}/tasks/${taskId}/checklistItems/${checklistItemId}`,
+        `${MS_GRAPH_BASE}/me/todo/lists/${encodePathSegment(listId)}/tasks/${encodePathSegment(taskId)}/checklistItems/${encodePathSegment(checklistItemId)}`,
         token,
         "PATCH",
         requestBody,
@@ -1561,7 +1562,7 @@ server.tool(
       }
 
       // Make a DELETE request to the Microsoft Graph API
-      const url = `${MS_GRAPH_BASE}/me/todo/lists/${listId}/tasks/${taskId}/checklistItems/${checklistItemId}`
+      const url = `${MS_GRAPH_BASE}/me/todo/lists/${encodePathSegment(listId)}/tasks/${encodePathSegment(taskId)}/checklistItems/${encodePathSegment(checklistItemId)}`
       console.error(`Deleting checklist item: ${url}`)
 
       // The DELETE method doesn't return a response body, so we expect null
@@ -1627,7 +1628,7 @@ server.tool(
 
       // Get all completed tasks from source list
       const tasksResponse = await makeGraphRequest<{ value: Task[] }>(
-        `${MS_GRAPH_BASE}/me/todo/lists/${sourceListId}/tasks?$filter=status eq 'completed'`,
+        `${MS_GRAPH_BASE}/me/todo/lists/${encodePathSegment(sourceListId)}/tasks?$filter=status eq 'completed'`,
         token,
       )
 
@@ -1683,7 +1684,7 @@ server.tool(
         try {
           // Create task in target list
           const createResponse = await makeGraphRequest(
-            `${MS_GRAPH_BASE}/me/todo/lists/${targetListId}/tasks`,
+            `${MS_GRAPH_BASE}/me/todo/lists/${encodePathSegment(targetListId)}/tasks`,
             token,
             "POST",
             {
@@ -1700,7 +1701,11 @@ server.tool(
 
           if (createResponse) {
             // Delete from source list
-            await makeGraphRequest(`${MS_GRAPH_BASE}/me/todo/lists/${sourceListId}/tasks/${task.id}`, token, "DELETE")
+            await makeGraphRequest(
+              `${MS_GRAPH_BASE}/me/todo/lists/${encodePathSegment(sourceListId)}/tasks/${encodePathSegment(task.id)}`,
+              token,
+              "DELETE",
+            )
             successCount++
           } else {
             failedTasks.push(task.title)
@@ -1853,7 +1858,7 @@ server.tool(
             // Try to get extensions
             try {
               const extResponse = await makeGraphRequest<any>(
-                `${MS_GRAPH_BASE}/me/todo/lists/${listId}/extensions`,
+                `${MS_GRAPH_BASE}/me/todo/lists/${encodePathSegment(listId)}/extensions`,
                 token,
               )
               results += `Extensions found: ${JSON.stringify(extResponse, null, 2)}\n`
