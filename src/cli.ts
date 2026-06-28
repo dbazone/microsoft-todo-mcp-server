@@ -1,9 +1,12 @@
 #!/usr/bin/env node
 
-import { startServer } from "./todo-index.js"
 import fs from "fs"
 import path from "path"
 import { fileURLToPath } from "url"
+
+process.env.MSTODO_SKIP_TODO_INDEX_AUTOSTART = "1"
+
+const { startServer } = await import("./todo-index.js")
 
 // Get the directory path for the current module
 const __filename = fileURLToPath(import.meta.url)

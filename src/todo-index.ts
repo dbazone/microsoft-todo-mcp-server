@@ -3,6 +3,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod"
 import { readFileSync, writeFileSync, existsSync } from "fs"
 import { join } from "path"
+import { createHash } from "crypto"
 import dotenv from "dotenv"
 import { tokenManager } from "./token-manager.js"
 
@@ -17,6 +18,8 @@ const MS_GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 const USER_AGENT = "microsoft-todo-mcp-server/1.0"
 const encodePathSegment = (value: string) => encodeURIComponent(value)
 const CREATE_TASK_IDEMPOTENCY_WINDOW_MS = 10_000
+const CREATE_TASK_IDEMPOTENCY_FILE_PATH =
+  process.env.MSTODO_CREATE_TASK_IDEMPOTENCY_FILE || join(process.cwd(), "create-task-idempotency.json")
 
 // Create server instance
 const server = new McpServer({
@@ -97,6 +100,11 @@ but API access is restricted for personal accounts.
       }
 
       throw new Error(`HTTP error! status: ${response.status}, body: ${errorText}`)
+    }
+
+    if (response.status === 204) {
+      console.error("Response received: 204 No Content")
+      return null
     }
 
     const data = await response.json()
@@ -290,12 +298,22 @@ interface CreateTaskInput {
   reminderDateTime?: string
   status?: "notStarted" | "inProgress" | "completed" | "waitingOnOthers" | "deferred"
   categories?: string[]
+  allowDuplicate?: boolean
 }
 
 const createTaskRequests = new Map<string, { expiresAt: number; promise: Promise<Task | null> }>()
 
-function getCreateTaskIdempotencyKey(input: CreateTaskInput): string {
-  return JSON.stringify({
+interface CreateTaskIdempotencyRecord {
+  taskId: string
+  createdAt: string
+  updatedAt: string
+  title: string
+}
+
+type CreateTaskIdempotencyStore = Record<string, CreateTaskIdempotencyRecord>
+
+function getCreateTaskIdempotencyPayload(input: CreateTaskInput) {
+  return {
     listId: input.listId,
     title: input.title,
     body: input.body ?? null,
@@ -305,8 +323,192 @@ function getCreateTaskIdempotencyKey(input: CreateTaskInput): string {
     isReminderOn: input.isReminderOn ?? null,
     reminderDateTime: input.reminderDateTime ?? null,
     status: input.status ?? null,
-    categories: input.categories ?? null,
-  })
+    categories: input.categories ? [...input.categories].sort() : null,
+  }
+}
+
+function getCreateTaskIdempotencyKey(input: CreateTaskInput): string {
+  return createHash("sha256").update(JSON.stringify(getCreateTaskIdempotencyPayload(input))).digest("hex")
+}
+
+function readCreateTaskIdempotencyStore(): CreateTaskIdempotencyStore {
+  if (!existsSync(CREATE_TASK_IDEMPOTENCY_FILE_PATH)) {
+    return {}
+  }
+
+  try {
+    return JSON.parse(readFileSync(CREATE_TASK_IDEMPOTENCY_FILE_PATH, "utf8")) as CreateTaskIdempotencyStore
+  } catch (error) {
+    console.error("Error reading create-task idempotency store:", error)
+    return {}
+  }
+}
+
+function writeCreateTaskIdempotencyStore(store: CreateTaskIdempotencyStore) {
+  try {
+    writeFileSync(CREATE_TASK_IDEMPOTENCY_FILE_PATH, JSON.stringify(store, null, 2), "utf8")
+  } catch (error) {
+    console.error("Error writing create-task idempotency store:", error)
+  }
+}
+
+async function getTaskById(token: string, listId: string, taskId: string): Promise<Task | null> {
+  return makeGraphRequest<Task>(
+    `${MS_GRAPH_BASE}/me/todo/lists/${encodePathSegment(listId)}/tasks/${encodePathSegment(taskId)}`,
+    token,
+  )
+}
+
+function normalizeDateTime(value?: string | { dateTime?: string; timeZone?: string }): string | null {
+  if (!value) {
+    return null
+  }
+
+  if (typeof value === "string") {
+    return value
+  }
+
+  return value.dateTime ?? null
+}
+
+function normalizeDateOnly(value: string | null): string | null {
+  if (!value) {
+    return null
+  }
+
+  return value.slice(0, 10)
+}
+
+function normalizeInstant(value: string | null): string | null {
+  if (!value) {
+    return null
+  }
+
+  const parsed = new Date(value)
+  return Number.isNaN(parsed.getTime()) ? value : parsed.toISOString()
+}
+
+function graphDateMatches(
+  actual: string | { dateTime?: string; timeZone?: string } | undefined,
+  expected: string | undefined,
+  compareDateOnly = false,
+): boolean {
+  const normalizedActual = normalizeDateTime(actual)
+  const normalizedExpected = expected ?? null
+
+  if (compareDateOnly) {
+    return normalizeDateOnly(normalizedActual) === normalizeDateOnly(normalizedExpected)
+  }
+
+  return normalizeInstant(normalizedActual) === normalizeInstant(normalizedExpected)
+}
+
+function normalizeCategories(categories?: string[]): string[] {
+  return categories ? [...categories].sort() : []
+}
+
+function taskMatchesCreateInput(task: Task, input: CreateTaskInput): boolean {
+  if (task.title !== input.title) {
+    return false
+  }
+
+  if (input.status && task.status !== input.status) {
+    return false
+  }
+
+  if (input.importance && task.importance !== input.importance) {
+    return false
+  }
+
+  if (!graphDateMatches(task.dueDateTime, input.dueDateTime, true)) {
+    return false
+  }
+
+  if (!graphDateMatches((task as any).startDateTime, input.startDateTime, true)) {
+    return false
+  }
+
+  if (!graphDateMatches(task.reminderDateTime, input.reminderDateTime)) {
+    return false
+  }
+
+  if (input.isReminderOn !== undefined && (task as any).isReminderOn !== input.isReminderOn) {
+    return false
+  }
+
+  if ((task.body?.content ?? null) !== (input.body ?? null)) {
+    return false
+  }
+
+  return JSON.stringify(normalizeCategories(task.categories)) === JSON.stringify(normalizeCategories(input.categories))
+}
+
+async function findExistingMatchingTask(token: string, input: CreateTaskInput): Promise<Task | null> {
+  const response = await makeGraphRequest<{ value: Task[] }>(
+    `${MS_GRAPH_BASE}/me/todo/lists/${encodePathSegment(input.listId)}/tasks?$top=100`,
+    token,
+  )
+
+  if (!response?.value) {
+    return null
+  }
+
+  return response.value.find((task) => taskMatchesCreateInput(task, input)) ?? null
+}
+
+async function findIdempotentTask(token: string, input: CreateTaskInput): Promise<Task | null> {
+  if (input.allowDuplicate) {
+    return null
+  }
+
+  const key = getCreateTaskIdempotencyKey(input)
+  const store = readCreateTaskIdempotencyStore()
+  const record = store[key]
+
+  if (record?.taskId) {
+    const task = await getTaskById(token, input.listId, record.taskId)
+    if (task) {
+      console.error("Found existing task via durable idempotency store")
+      return task
+    }
+
+    delete store[key]
+    writeCreateTaskIdempotencyStore(store)
+  }
+
+  const matchingTask = await findExistingMatchingTask(token, input)
+  if (matchingTask) {
+    store[key] = {
+      taskId: matchingTask.id,
+      createdAt: record?.createdAt ?? new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      title: matchingTask.title,
+    }
+    writeCreateTaskIdempotencyStore(store)
+    console.error("Found existing matching task before create; storing idempotency record")
+    return matchingTask
+  }
+
+  return null
+}
+
+function rememberIdempotentTask(input: CreateTaskInput, task: Task) {
+  if (input.allowDuplicate) {
+    return
+  }
+
+  const key = getCreateTaskIdempotencyKey(input)
+  const store = readCreateTaskIdempotencyStore()
+  const now = new Date().toISOString()
+
+  store[key] = {
+    taskId: task.id,
+    createdAt: store[key]?.createdAt ?? now,
+    updatedAt: now,
+    title: task.title,
+  }
+
+  writeCreateTaskIdempotencyStore(store)
 }
 
 function scheduleCreateTaskIdempotencyCleanup(
@@ -1045,6 +1247,7 @@ server.tool(
       .optional()
       .describe("Status of the task"),
     categories: z.array(z.string()).optional().describe("Categories associated with the task"),
+    allowDuplicate: z.boolean().optional().describe("Allow creating a duplicate task with the same payload"),
   },
   async ({
     listId,
@@ -1057,6 +1260,7 @@ server.tool(
     reminderDateTime,
     status,
     categories,
+    allowDuplicate,
   }) => {
     try {
       const token = await getAccessToken()
@@ -1066,6 +1270,32 @@ server.tool(
             {
               type: "text",
               text: "Failed to authenticate with Microsoft API",
+            },
+          ],
+        }
+      }
+
+      const createInput: CreateTaskInput = {
+        listId,
+        title,
+        body,
+        dueDateTime,
+        startDateTime,
+        importance,
+        isReminderOn,
+        reminderDateTime,
+        status,
+        categories,
+        allowDuplicate,
+      }
+
+      const existingTask = await findIdempotentTask(token, createInput)
+      if (existingTask) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Task already exists; returning existing task.\nID: ${existingTask.id}\nTitle: ${existingTask.title}`,
             },
           ],
         }
@@ -1120,18 +1350,7 @@ server.tool(
       }
 
       const response = await runCreateTaskOnce(
-        {
-          listId,
-          title,
-          body,
-          dueDateTime,
-          startDateTime,
-          importance,
-          isReminderOn,
-          reminderDateTime,
-          status,
-          categories,
-        },
+        createInput,
         () =>
           makeGraphRequest<Task>(
             `${MS_GRAPH_BASE}/me/todo/lists/${encodePathSegment(listId)}/tasks`,
@@ -1151,6 +1370,8 @@ server.tool(
           ],
         }
       }
+
+      rememberIdempotentTask(createInput, response)
 
       return {
         content: [
@@ -2037,8 +2258,9 @@ export async function startServer(config?: ServerConfig): Promise<void> {
   }
 }
 
-// Main entry point when executed directly
-if (import.meta.url === `file://${process.argv[1]}`) {
+// Main entry point when executed directly. The CLI sets this flag before importing
+// this module so bundled builds do not start two MCP servers in one process.
+if (process.env.MSTODO_SKIP_TODO_INDEX_AUTOSTART !== "1" && import.meta.url === `file://${process.argv[1]}`) {
   startServer().catch((error) => {
     console.error("Fatal error in main():", error)
     process.exit(1)
