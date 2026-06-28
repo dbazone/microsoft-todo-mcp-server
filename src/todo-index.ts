@@ -16,6 +16,7 @@ console.error("Current working directory:", process.cwd())
 const MS_GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 const USER_AGENT = "microsoft-todo-mcp-server/1.0"
 const encodePathSegment = (value: string) => encodeURIComponent(value)
+const CREATE_TASK_IDEMPOTENCY_WINDOW_MS = 10_000
 
 // Create server instance
 const server = new McpServer({
@@ -55,8 +56,9 @@ async function makeGraphRequest<T>(url: string, token: string, method = "GET", b
 
     let response = await fetch(url, options)
 
-    // If we get a 401, try to refresh the token and retry once
-    if (response.status === 401) {
+    // If we get a 401, try to refresh the token and retry once.
+    // Do not retry POST because Microsoft Graph task creation is non-idempotent.
+    if (response.status === 401 && method !== "POST") {
       console.error("Got 401, attempting token refresh...")
       const newToken = await getAccessToken() // This will trigger refresh
       if (newToken && newToken !== token) {
@@ -64,6 +66,8 @@ async function makeGraphRequest<T>(url: string, token: string, method = "GET", b
         headers.Authorization = `Bearer ${newToken}`
         response = await fetch(url, { ...options, headers })
       }
+    } else if (response.status === 401 && method === "POST") {
+      console.error("Got 401 for POST request; skipping automatic retry to avoid duplicate creation")
     }
 
     if (!response.ok) {
@@ -273,6 +277,87 @@ interface Task {
     contentType: string
   }
   categories?: string[]
+}
+
+interface CreateTaskInput {
+  listId: string
+  title: string
+  body?: string
+  dueDateTime?: string
+  startDateTime?: string
+  importance?: "low" | "normal" | "high"
+  isReminderOn?: boolean
+  reminderDateTime?: string
+  status?: "notStarted" | "inProgress" | "completed" | "waitingOnOthers" | "deferred"
+  categories?: string[]
+}
+
+const createTaskRequests = new Map<string, { expiresAt: number; promise: Promise<Task | null> }>()
+
+function getCreateTaskIdempotencyKey(input: CreateTaskInput): string {
+  return JSON.stringify({
+    listId: input.listId,
+    title: input.title,
+    body: input.body ?? null,
+    dueDateTime: input.dueDateTime ?? null,
+    startDateTime: input.startDateTime ?? null,
+    importance: input.importance ?? null,
+    isReminderOn: input.isReminderOn ?? null,
+    reminderDateTime: input.reminderDateTime ?? null,
+    status: input.status ?? null,
+    categories: input.categories ?? null,
+  })
+}
+
+function scheduleCreateTaskIdempotencyCleanup(
+  key: string,
+  entry: { expiresAt: number; promise: Promise<Task | null> },
+) {
+  const timeout = setTimeout(() => {
+    if (createTaskRequests.get(key) === entry && Date.now() >= entry.expiresAt) {
+      createTaskRequests.delete(key)
+    }
+  }, CREATE_TASK_IDEMPOTENCY_WINDOW_MS)
+
+  timeout.unref?.()
+}
+
+function runCreateTaskOnce(input: CreateTaskInput, createTask: () => Promise<Task | null>): Promise<Task | null> {
+  const now = Date.now()
+  const key = getCreateTaskIdempotencyKey(input)
+  const existing = createTaskRequests.get(key)
+
+  if (existing && existing.expiresAt > now) {
+    console.error("Deduplicating identical create-task request")
+    return existing.promise
+  }
+
+  if (existing) {
+    createTaskRequests.delete(key)
+  }
+
+  const entry = {
+    expiresAt: now + CREATE_TASK_IDEMPOTENCY_WINDOW_MS,
+    promise: createTask(),
+  }
+
+  createTaskRequests.set(key, entry)
+  entry.promise.then(
+    (task) => {
+      if (!task) {
+        createTaskRequests.delete(key)
+        return
+      }
+
+      entry.expiresAt = Date.now() + CREATE_TASK_IDEMPOTENCY_WINDOW_MS
+      scheduleCreateTaskIdempotencyCleanup(key, entry)
+    },
+    () => {
+      createTaskRequests.delete(key)
+    },
+  )
+
+  return entry.promise
 }
 
 interface ChecklistItem {
@@ -1034,11 +1119,26 @@ server.tool(
         taskBody.categories = categories
       }
 
-      const response = await makeGraphRequest<Task>(
-        `${MS_GRAPH_BASE}/me/todo/lists/${encodePathSegment(listId)}/tasks`,
-        token,
-        "POST",
-        taskBody,
+      const response = await runCreateTaskOnce(
+        {
+          listId,
+          title,
+          body,
+          dueDateTime,
+          startDateTime,
+          importance,
+          isReminderOn,
+          reminderDateTime,
+          status,
+          categories,
+        },
+        () =>
+          makeGraphRequest<Task>(
+            `${MS_GRAPH_BASE}/me/todo/lists/${encodePathSegment(listId)}/tasks`,
+            token,
+            "POST",
+            taskBody,
+          ),
       )
 
       if (!response) {
