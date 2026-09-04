@@ -226,6 +226,7 @@ The server provides 13 tools for comprehensive Microsoft To Do management:
   - Supports OData query parameters: `$filter`, `$select`, `$orderby`, `$top`, `$skip`, `$count`
 - **`create-task`** - Create a new task with full property support
   - Title, description, due date, start date, importance, reminders, status, categories
+  - If no due date is provided, defaults to today's local date at midday IST
 - **`update-task`** - Update any task properties
 - **`delete-task`** - Delete a task and all its checklist items
 

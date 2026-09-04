@@ -20,6 +20,10 @@ const encodePathSegment = (value: string) => encodeURIComponent(value)
 const CREATE_TASK_IDEMPOTENCY_WINDOW_MS = 10_000
 const CREATE_TASK_IDEMPOTENCY_FILE_PATH =
   process.env.MSTODO_CREATE_TASK_IDEMPOTENCY_FILE || join(process.cwd(), "create-task-idempotency.json")
+const DEFAULT_DUE_DATE_WHEN_MISSING = (process.env.MSTODO_DEFAULT_DUE_DATE_WHEN_MISSING || "today").toLowerCase()
+const DEFAULT_DUE_DATE_TIME_ZONE = process.env.MSTODO_DEFAULT_DUE_DATE_TIME_ZONE || "Asia/Kolkata"
+const DEFAULT_DUE_DATE_UTC_OFFSET = process.env.MSTODO_DEFAULT_DUE_DATE_UTC_OFFSET || "+05:30"
+const DEFAULT_DUE_DATE_LOCAL_TIME = process.env.MSTODO_DEFAULT_DUE_DATE_LOCAL_TIME || "12:00:00"
 
 // Create server instance
 const server = new McpServer({
@@ -328,7 +332,9 @@ function getCreateTaskIdempotencyPayload(input: CreateTaskInput) {
 }
 
 function getCreateTaskIdempotencyKey(input: CreateTaskInput): string {
-  return createHash("sha256").update(JSON.stringify(getCreateTaskIdempotencyPayload(input))).digest("hex")
+  return createHash("sha256")
+    .update(JSON.stringify(getCreateTaskIdempotencyPayload(input)))
+    .digest("hex")
 }
 
 function readCreateTaskIdempotencyStore(): CreateTaskIdempotencyStore {
@@ -386,6 +392,30 @@ function normalizeInstant(value: string | null): string | null {
 
   const parsed = new Date(value)
   return Number.isNaN(parsed.getTime()) ? value : parsed.toISOString()
+}
+
+function getLocalDateParts(date: Date, timeZone: string): { year: string; month: string; day: string } {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(date)
+
+  return {
+    year: parts.find((part) => part.type === "year")?.value ?? "1970",
+    month: parts.find((part) => part.type === "month")?.value ?? "01",
+    day: parts.find((part) => part.type === "day")?.value ?? "01",
+  }
+}
+
+function getDefaultDueDateTimeWhenMissing(): string | undefined {
+  if (DEFAULT_DUE_DATE_WHEN_MISSING !== "today") {
+    return undefined
+  }
+
+  const { year, month, day } = getLocalDateParts(new Date(), DEFAULT_DUE_DATE_TIME_ZONE)
+  return `${year}-${month}-${day}T${DEFAULT_DUE_DATE_LOCAL_TIME}${DEFAULT_DUE_DATE_UTC_OFFSET}`
 }
 
 function graphDateMatches(
@@ -1237,7 +1267,10 @@ server.tool(
     listId: z.string().describe("ID of the task list"),
     title: z.string().describe("Title of the task"),
     body: z.string().optional().describe("Description or body content of the task"),
-    dueDateTime: z.string().optional().describe("Due date in ISO format (e.g., 2023-12-31T23:59:59Z)"),
+    dueDateTime: z
+      .string()
+      .optional()
+      .describe("Due date in ISO format (e.g., 2023-12-31T23:59:59Z). Defaults to today's local date when omitted."),
     startDateTime: z.string().optional().describe("Start date in ISO format (e.g., 2023-12-31T23:59:59Z)"),
     importance: z.enum(["low", "normal", "high"]).optional().describe("Task importance"),
     isReminderOn: z.boolean().optional().describe("Whether to enable reminder for this task"),
@@ -1275,11 +1308,13 @@ server.tool(
         }
       }
 
+      const effectiveDueDateTime = dueDateTime ?? getDefaultDueDateTimeWhenMissing()
+
       const createInput: CreateTaskInput = {
         listId,
         title,
         body,
-        dueDateTime,
+        dueDateTime: effectiveDueDateTime,
         startDateTime,
         importance,
         isReminderOn,
@@ -1312,9 +1347,9 @@ server.tool(
         }
       }
 
-      if (dueDateTime) {
+      if (effectiveDueDateTime) {
         taskBody.dueDateTime = {
-          dateTime: dueDateTime,
+          dateTime: effectiveDueDateTime,
           timeZone: "UTC",
         }
       }
@@ -1349,15 +1384,13 @@ server.tool(
         taskBody.categories = categories
       }
 
-      const response = await runCreateTaskOnce(
-        createInput,
-        () =>
-          makeGraphRequest<Task>(
-            `${MS_GRAPH_BASE}/me/todo/lists/${encodePathSegment(listId)}/tasks`,
-            token,
-            "POST",
-            taskBody,
-          ),
+      const response = await runCreateTaskOnce(createInput, () =>
+        makeGraphRequest<Task>(
+          `${MS_GRAPH_BASE}/me/todo/lists/${encodePathSegment(listId)}/tasks`,
+          token,
+          "POST",
+          taskBody,
+        ),
       )
 
       if (!response) {
